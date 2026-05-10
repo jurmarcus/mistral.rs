@@ -174,13 +174,25 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        seq.responder()
+                        // If the client has dropped (e.g. HTTP timeout), the
+                        // responder channel is closed — sending fails with
+                        // SendError. The OLD code .unwrap()'d here, which
+                        // killed the whole engine and forced a reboot for
+                        // every client-side timeout. Now we log and move on:
+                        // there's no one to deliver to, and the engine
+                        // should keep serving other sequences.
+                        if let Err(err) = seq
+                            .responder()
                             .send(Response::ModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
                             .await
-                            .unwrap();
+                        {
+                            tracing::debug!(
+                                "responder dropped before ModelError delivery: {err}"
+                            );
+                        }
                     } else {
                         let partial_completion_response = CompletionResponse {
                             id: seq.id().to_string(),
@@ -192,13 +204,18 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        seq.responder()
+                        if let Err(err) = seq
+                            .responder()
                             .send(Response::CompletionModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
                             .await
-                            .unwrap();
+                        {
+                            tracing::debug!(
+                                "responder dropped before CompletionModelError delivery: {err}"
+                            );
+                        }
                     }
                 }
                 for seq in $seq_slice.iter_mut() {
