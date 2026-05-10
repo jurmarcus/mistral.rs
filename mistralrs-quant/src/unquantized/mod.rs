@@ -199,6 +199,40 @@ impl QuantMethod for UnquantLinear {
                 // Reshape back to [b, s, k, out_features]
                 result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
             }
+            // MoE down_proj path: 4D input where the per-expert dim is
+            // already present (b_size, seq_len, num_experts_per_tok, hidden_dim).
+            // Each (b, s, k) slot is matmul'd against its own selected
+            // expert (no broadcasting across k). Needed for Gemma 4
+            // 26B-A4B-it's SwitchGLU.down_proj — its input has the per-
+            // expert dim that gate_proj/up_proj produced via the 5D path.
+            &[b_size, seq_len, num_experts_per_tok_in, hidden_dim]
+                if {
+                    // Disambiguate from any future 4D shapes by matching
+                    // indices rank too: this case expects 3D indices of
+                    // shape (b_size, seq_len, num_experts_per_tok).
+                    let (b, s, k) = indices.dims3().unwrap_or((0, 0, 0));
+                    b == b_size && s == seq_len && k == num_experts_per_tok_in
+                } =>
+            {
+                let (_, _, num_experts_per_tok) = indices.dims3()?;
+                let n = b_size * seq_len * num_experts_per_tok;
+
+                // Select expert weights: [n, out_features, in_features]
+                let flat_indices = indices.reshape((n,))?;
+                let selected_w = w.index_select(&flat_indices, 0)?;
+
+                // Flatten input to [n, hidden_dim] — already has the
+                // per-expert dim, no broadcast needed.
+                let a_flat = a.reshape((n, hidden_dim))?;
+
+                // Matmul: [n, 1, hidden] @ [n, hidden, out] -> [n, 1, out]
+                let result = a_flat
+                    .unsqueeze(1)?
+                    .matmul(&selected_w.transpose(1, 2)?)?
+                    .squeeze(1)?;
+
+                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+            }
             // CUDA path: 3D input (num_tokens, 1, hidden_dim)
             &[num_tokens, 1, hidden_dim] => {
                 let (_, num_experts_per_tok) = indices.dims2()?;
